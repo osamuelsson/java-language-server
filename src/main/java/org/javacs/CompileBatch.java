@@ -41,7 +41,24 @@ class CompileBatch implements AutoCloseable {
             // The results of borrow.task.analyze() are unreliable when errors are present
             // You can get at `Element` values using `Trees`
             borrow.task.analyze();
-        } catch (IOException e) {
+        } catch (Throwable e) {
+            // If parse/analyze fails — including AssertionError from javac internals when the
+            // classpath is broken — the borrow must be released, otherwise every subsequent
+            // compile fails with "Compiler is already in-use!".
+            try {
+                borrow.close();
+            } catch (Throwable suppressed) {
+                e.addSuppressed(suppressed);
+            }
+            if (e instanceof IOException) {
+                throw new RuntimeException(e);
+            }
+            if (e instanceof RuntimeException re) {
+                throw re;
+            }
+            if (e instanceof Error er) {
+                throw er;
+            }
             throw new RuntimeException(e);
         }
     }
