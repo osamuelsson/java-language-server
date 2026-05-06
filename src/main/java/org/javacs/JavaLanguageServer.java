@@ -244,8 +244,14 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void didChangeConfiguration(DidChangeConfigurationParams change) {
-        var java = change.settings.getAsJsonObject().get("java");
+        var root = change.settings == null ? null : change.settings.getAsJsonObject();
+        var java = root == null ? null : root.get("java");
         LOG.info("Received java settings " + java);
+        // Some clients (e.g. Eglot) send didChangeConfiguration with an empty or java-less
+        // settings object. Don't NPE in that case; just leave existing settings untouched.
+        if (java == null || java.isJsonNull() || !java.isJsonObject()) {
+            return;
+        }
         settings = java.getAsJsonObject();
     }
 
