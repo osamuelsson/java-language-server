@@ -172,7 +172,6 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public InitializeResult initialize(InitializeParams params) {
         this.workspaceRoot = Paths.get(params.rootUri);
-        FileStore.setWorkspaceRoots(Set.of(Paths.get(params.rootUri)));
 
         var c = new JsonObject();
         c.addProperty("textDocumentSync", 2); // Incremental
@@ -212,6 +211,11 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void initialized() {
         client.registerCapability("workspace/didChangeWatchedFiles", watchFiles(watchFiles));
+        // Walking the workspace can take many seconds in large monorepos. Doing it here
+        // (rather than in initialize) keeps the initialize response under the client's
+        // request timeout. Subsequent didOpen/hover/etc. notifications queue on the main
+        // thread and run after this completes.
+        FileStore.setWorkspaceRoots(Set.of(workspaceRoot));
     }
 
     private JsonObject watchFiles(String... globPatterns) {
