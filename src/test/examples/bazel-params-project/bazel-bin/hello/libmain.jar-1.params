@@ -1,0 +1,5 @@
+--classpath
+bazel-out/darwin_arm64-fastbuild/bin/external/maven/v1/https/repo1.maven.org/com/google/guava/guava/18.0/header_guava-18.0.jar
+bazel-out/darwin_arm64-fastbuild/bin/external/maven/v1/https/repo1.maven.org/com/google/errorprone/error_prone_annotations/2.3.4/header_error_prone_annotations-2.3.4.jar
+--reduce_classpath_mode
+JAVABUILDER_REDUCED

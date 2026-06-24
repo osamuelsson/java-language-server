@@ -5,14 +5,16 @@ import com.google.devtools.build.lib.analysis.AnalysisProtosV2;
 import com.google.devtools.build.lib.analysis.AnalysisProtosV2.PathFragment;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.FileVisitOption;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors; // Added for Collectors.toSet()
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 class InferConfig {
@@ -102,16 +104,22 @@ class InferConfig {
 
         // Bazel
         var bazelWorkspaceRoot = bazelWorkspaceRoot();
-        if (Files.exists(bazelWorkspaceRoot.resolve("WORKSPACE"))) {
+        if (isBazelWorkspace(bazelWorkspaceRoot)) {
             return bazelClasspath(bazelWorkspaceRoot);
         }
 
         return Collections.emptySet();
     }
 
+    private static boolean isBazelWorkspace(Path dir) {
+        return Files.exists(dir.resolve("WORKSPACE"))
+                || Files.exists(dir.resolve("WORKSPACE.bazel"))
+                || Files.exists(dir.resolve("MODULE.bazel"));
+    }
+
     private Path bazelWorkspaceRoot() {
         for (var current = workspaceRoot; current != null; current = current.getParent()) {
-            if (Files.exists(current.resolve("WORKSPACE"))) {
+            if (isBazelWorkspace(current)) {
                 return current;
             }
         }
@@ -143,7 +151,7 @@ class InferConfig {
 
         // Bazel
         var bazelWorkspaceRoot = bazelWorkspaceRoot();
-        if (Files.exists(bazelWorkspaceRoot.resolve("WORKSPACE"))) {
+        if (isBazelWorkspace(bazelWorkspaceRoot)) {
             return bazelSourcepath(bazelWorkspaceRoot);
         }
 
@@ -296,6 +304,15 @@ class InferConfig {
     }
 
     private Set<Path> bazelClasspath(Path bazelWorkspaceRoot) {
+        // Fast path: read classpath from pre-built .params files in bazel-bin/
+        var fromParams = bazelClasspathFromParams(bazelWorkspaceRoot);
+        if (!fromParams.isEmpty()) {
+            LOG.info("Using classpath from .params files (fast path)");
+            return fromParams;
+        }
+
+        // Slow path: run bazel aquery (original behavior)
+        LOG.info("No .params files found, falling back to bazel aquery");
         var absolute = new HashSet<Path>();
 
         // Add protos
@@ -311,6 +328,91 @@ class InferConfig {
             absolute.add(bazelWorkspaceRoot.resolve(relative));
         }
         return absolute;
+    }
+
+    private Set<Path> bazelClasspathFromParams(Path bazelWorkspaceRoot) {
+        var bazelBin = bazelWorkspaceRoot.resolve("bazel-bin");
+        if (!Files.exists(bazelBin)) {
+            LOG.info("No bazel-bin directory found at " + bazelBin);
+            return Collections.emptySet();
+        }
+
+        var prefix = bazelWorkspaceRoot.relativize(workspaceRoot);
+        Path searchRoot;
+        if (prefix.toString().isEmpty()) {
+            searchRoot = bazelBin;
+        } else {
+            searchRoot = bazelBin.resolve(prefix);
+            if (!Files.exists(searchRoot)) {
+                LOG.info("Scoped bazel-bin path does not exist: " + searchRoot + ", searching all of bazel-bin");
+                searchRoot = bazelBin;
+            }
+        }
+
+        LOG.info("Searching for .params files in " + searchRoot);
+        var paramsFiles = findParamsFiles(searchRoot);
+        if (paramsFiles.isEmpty()) {
+            LOG.info("No .params files found in " + searchRoot);
+            return Collections.emptySet();
+        }
+        LOG.info("Found " + paramsFiles.size() + " .params files");
+
+        var classpath = new HashSet<Path>();
+        for (var paramsFile : paramsFiles) {
+            if (searchRoot.equals(bazelBin)) {
+                var relative = bazelBin.relativize(paramsFile);
+                if (relative.startsWith("external")) {
+                    continue;
+                }
+            }
+            classpath.addAll(parseParamsClasspath(paramsFile, bazelWorkspaceRoot));
+        }
+        LOG.info("Inferred " + classpath.size() + " classpath entries from .params files");
+        return classpath;
+    }
+
+    private static List<Path> findParamsFiles(Path searchRoot) {
+        var result = new ArrayList<Path>();
+        if (!Files.exists(searchRoot)) {
+            return result;
+        }
+        try (var stream = Files.find(
+                searchRoot,
+                Integer.MAX_VALUE,
+                (path, attrs) -> attrs.isRegularFile() && path.getFileName().toString().endsWith(".params"),
+                FileVisitOption.FOLLOW_LINKS)) {
+            stream.forEach(result::add);
+        } catch (IOException e) {
+            LOG.warning("Failed to scan for params files in " + searchRoot + ": " + e.getMessage());
+        }
+        return result;
+    }
+
+    private static Set<Path> parseParamsClasspath(Path paramsFile, Path bazelWorkspaceRoot) {
+        var entries = new HashSet<Path>();
+        try {
+            var lines = Files.readAllLines(paramsFile);
+            var inClasspath = false;
+            for (var line : lines) {
+                var trimmed = line.trim();
+                if (trimmed.isEmpty()) continue;
+                if (trimmed.equals("--classpath")) {
+                    inClasspath = true;
+                    continue;
+                }
+                if (trimmed.startsWith("--")) {
+                    if (inClasspath) break;
+                    continue;
+                }
+                if (inClasspath) {
+                    var resolved = bazelWorkspaceRoot.resolve(trimmed);
+                    entries.add(resolved);
+                }
+            }
+        } catch (IOException e) {
+            LOG.warning("Failed to read params file " + paramsFile + ": " + e.getMessage());
+        }
+        return entries;
     }
 
     private Set<Path> bazelSourcepath(Path bazelWorkspaceRoot) {
@@ -522,8 +624,13 @@ class InferConfig {
                             .redirectError(ProcessBuilder.Redirect.INHERIT)
                             .redirectOutput(output.toFile())
                             .start();
-            // Wait for process to exit
-            var result = process.waitFor();
+            var finished = process.waitFor(120, TimeUnit.SECONDS);
+            if (!finished) {
+                LOG.severe("`" + String.join(" ", command) + "` timed out after 120 seconds");
+                process.destroyForcibly();
+                return NOT_FOUND;
+            }
+            var result = process.exitValue();
             if (result != 0) {
                 LOG.severe("`" + String.join(" ", command) + "` returned " + result);
                 if (!allowNonZeroExit) {
